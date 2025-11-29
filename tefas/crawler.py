@@ -17,7 +17,7 @@ from tefas.schema import BreakdownSchema, InfoSchema
 
 
 class Crawler:
-    """Fetch public fund information from ``http://www.fundturkey.com.tr``.
+    """Fetch public fund information from ``https://www.tefas.gov.tr``.
 
     Examples:
 
@@ -39,7 +39,7 @@ class Crawler:
     4  2020-11-16  YAC  1.827832
     """
 
-    root_url = "https://fundturkey.com.tr"
+    root_url = "https://www.tefas.gov.tr"
     detail_endpoint = "/api/DB/BindHistoryAllocation"
     info_endpoint = "/api/DB/BindHistoryInfo"
     headers = {
@@ -51,8 +51,8 @@ class Crawler:
         ),
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Origin": "https://fundturkey.com.tr",
-        "Referer": "https://fundturkey.com.tr/TarihselVeriler.aspx",
+        "Origin": "https://www.tefas.gov.tr",
+        "Referer": "https://www.tefas.gov.tr/TarihselVeriler.aspx",
     }
 
     def __init__(self):
