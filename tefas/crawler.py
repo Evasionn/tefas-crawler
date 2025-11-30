@@ -284,6 +284,36 @@ class Crawler:
                 # Other HTTP errors
                 response.raise_for_status()
             
+            # Check if response is HTML (robot check page) or contains rate limiting message
+            response_text = response.text.lower()
+            is_html_response = response.headers.get('Content-Type', '').startswith('text/html')
+            is_rate_limit_message = any(keyword in response_text for keyword in [
+                'rate limit', 'rate limiting', 'robot check', 'too many requests',
+                'stuck at rate limiting', 'blocked', 'captcha', 'access denied'
+            ])
+            
+            if is_html_response or is_rate_limit_message:
+                logger.warning(
+                    f"Received HTML response or rate limiting message (possible robot check). "
+                    f"Attempt {attempt + 1}/{self.max_retries + 1}"
+                )
+                if attempt < self.max_retries:
+                    backoff = self._calculate_backoff(attempt)
+                    logger.info(f"Waiting {backoff:.2f} seconds before retry...")
+                    time.sleep(backoff)
+                    # Rotate User-Agent and refresh session
+                    self.user_agent = random.choice(USER_AGENTS)
+                    self.headers["User-Agent"] = self.user_agent
+                    self.session = _get_session()
+                    _ = self.session.get(self.root_url, timeout=self.timeout)
+                    self.cookies = self.session.cookies.get_dict()
+                    return self._do_post(endpoint, data, attempt + 1)
+                else:
+                    raise Exception(
+                        "Rate limiting or robot check detected. "
+                        "Max attempts reached. Please try again later."
+                    )
+            
             # Parse JSON response
             try:
                 json_response = response.json()
