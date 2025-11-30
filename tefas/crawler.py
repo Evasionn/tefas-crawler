@@ -4,6 +4,8 @@ Crawls public invenstment fund information from Turkey Electronic Fund Trading P
 """
 
 import ssl
+import random
+import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Union
 
@@ -11,13 +13,27 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
+from urllib3.util.retry import Retry
 import time
 
 from tefas.schema import BreakdownSchema, InfoSchema
 
+logger = logging.getLogger(__name__)
+
+# User-Agent pool for rotation
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+]
+
 
 class Crawler:
     """Fetch public fund information from ``https://www.tefas.gov.tr``.
+
+    Improved with rate limiting, robot detection, and better error handling.
 
     Examples:
 
@@ -42,23 +58,80 @@ class Crawler:
     root_url = "https://www.tefas.gov.tr"
     detail_endpoint = "/api/DB/BindHistoryAllocation"
     info_endpoint = "/api/DB/BindHistoryInfo"
-    headers = {
-        "Connection": "keep-alive",
-        "X-Requested-With": "XMLHttpRequest",
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/86.0.4240.198 Safari/537.36"
-        ),
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Origin": "https://www.tefas.gov.tr",
-        "Referer": "https://www.tefas.gov.tr/TarihselVeriler.aspx",
-    }
-
-    def __init__(self):
+    
+    def __init__(
+        self,
+        request_delay: float = 1.0,
+        max_retries: int = 5,
+        timeout: int = 30,
+        base_backoff: float = 2.0,
+        jitter: bool = True,
+    ):
+        """Initialize the crawler with configurable rate limiting.
+        
+        Args:
+            request_delay: Minimum delay between requests in seconds (default: 1.0)
+            max_retries: Maximum number of retry attempts (default: 5)
+            timeout: Request timeout in seconds (default: 30)
+            base_backoff: Base multiplier for exponential backoff (default: 2.0)
+            jitter: Whether to add random jitter to backoff delays (default: True)
+        """
+        self.request_delay = request_delay
+        self.max_retries = max_retries
+        self.timeout = timeout
+        self.base_backoff = base_backoff
+        self.jitter = jitter
+        self.last_request_time = 0.0
+        
+        # Rotate User-Agent
+        self.user_agent = random.choice(USER_AGENTS)
+        self.headers = {
+            "Connection": "keep-alive",
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": self.user_agent,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Origin": "https://www.tefas.gov.tr",
+            "Referer": "https://www.tefas.gov.tr/TarihselVeriler.aspx",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+        
         self.session = _get_session()
-        _ = self.session.get(self.root_url)
+        # Initial request to get cookies
+        _ = self.session.get(self.root_url, timeout=self.timeout)
         self.cookies = self.session.cookies.get_dict()
+        
+        logger.info(f"Crawler initialized with User-Agent: {self.user_agent[:50]}...")
+
+    def _enforce_rate_limit(self):
+        """Enforce minimum delay between requests."""
+        elapsed = time.time() - self.last_request_time
+        if elapsed < self.request_delay:
+            sleep_time = self.request_delay - elapsed
+            time.sleep(sleep_time)
+        self.last_request_time = time.time()
+
+    def _calculate_backoff(self, attempt: int) -> float:
+        """Calculate exponential backoff delay with optional jitter.
+        
+        Args:
+            attempt: Current retry attempt number (0-indexed)
+            
+        Returns:
+            Delay in seconds
+        """
+        delay = self.base_backoff ** attempt
+        
+        if self.jitter:
+            # Add random jitter (±25%) to prevent thundering herd
+            jitter_amount = delay * 0.25 * (2 * random.random() - 1)
+            delay = max(0.1, delay + jitter_amount)
+        
+        return delay
 
     def fetch(
         self,
@@ -120,25 +193,149 @@ class Crawler:
 
         return merged
 
-    def _do_post(self, endpoint: str, data: Dict[str, str], attempt: int = 0) -> Dict[str, str]:
-        max_attempt = 5
+    def _do_post(
+        self, 
+        endpoint: str, 
+        data: Dict[str, str], 
+        attempt: int = 0
+    ) -> Dict[str, str]:
+        """Make POST request with rate limiting, retry logic, and error handling.
+        
+        Args:
+            endpoint: API endpoint path
+            data: POST data payload
+            attempt: Current retry attempt (0-indexed)
+            
+        Returns:
+            Response data dictionary
+            
+        Raises:
+            requests.exceptions.RequestException: On network errors
+            ValueError: On invalid response format
+            Exception: On rate limiting or robot check failures
+        """
+        # Enforce rate limit before request
+        self._enforce_rate_limit()
+        
         try:
             response = self.session.post(
-                url=f"{self.root_url}/{endpoint}",
+                url=f"{self.root_url}{endpoint}",
                 data=data,
                 cookies=self.cookies,
                 headers=self.headers,
+                timeout=self.timeout,
             )
-            return response.json().get("data", {})
-        except ValueError:
-            if attempt == max_attempt:
-                raise Exception("Max attempt limit reached. Wait for a while before trying again")
-            attempt += 1
-            sleep_sec = attempt * 5
-            print("Stuck at rate limiting or robot check. Waiting for "+str(sleep_sec)+" seconds to retry. Attempt #"+str(attempt))
-            time.sleep(sleep_sec)
-            print("Trying..")
-            return self._do_post(endpoint, data, attempt)
+            
+            # Check HTTP status code
+            if response.status_code == 429:
+                # Too Many Requests - rate limited
+                retry_after = int(response.headers.get("Retry-After", 60))
+                logger.warning(
+                    f"Rate limited (429). Retry-After: {retry_after}s. "
+                    f"Attempt {attempt + 1}/{self.max_retries + 1}"
+                )
+                if attempt < self.max_retries:
+                    time.sleep(retry_after)
+                    return self._do_post(endpoint, data, attempt + 1)
+                else:
+                    raise Exception(
+                        f"Rate limited. Max attempts ({self.max_retries + 1}) reached. "
+                        f"Please wait {retry_after} seconds before trying again."
+                    )
+            
+            elif response.status_code == 403:
+                # Forbidden - possible robot check
+                logger.warning(
+                    f"Forbidden (403) - possible robot check. "
+                    f"Attempt {attempt + 1}/{self.max_retries + 1}"
+                )
+                if attempt < self.max_retries:
+                    backoff = self._calculate_backoff(attempt)
+                    logger.info(f"Waiting {backoff:.2f} seconds before retry...")
+                    time.sleep(backoff)
+                    # Rotate User-Agent on retry
+                    self.user_agent = random.choice(USER_AGENTS)
+                    self.headers["User-Agent"] = self.user_agent
+                    # Refresh session and cookies
+                    self.session = _get_session()
+                    _ = self.session.get(self.root_url, timeout=self.timeout)
+                    self.cookies = self.session.cookies.get_dict()
+                    return self._do_post(endpoint, data, attempt + 1)
+                else:
+                    raise Exception(
+                        "Forbidden (403) - possible robot check. "
+                        "Max attempts reached. Please try again later."
+                    )
+            
+            elif response.status_code == 503:
+                # Service Unavailable
+                logger.warning(
+                    f"Service unavailable (503). Attempt {attempt + 1}/{self.max_retries + 1}"
+                )
+                if attempt < self.max_retries:
+                    backoff = self._calculate_backoff(attempt)
+                    logger.info(f"Waiting {backoff:.2f} seconds before retry...")
+                    time.sleep(backoff)
+                    return self._do_post(endpoint, data, attempt + 1)
+                else:
+                    raise Exception("Service unavailable. Max attempts reached.")
+            
+            elif not response.ok:
+                # Other HTTP errors
+                response.raise_for_status()
+            
+            # Parse JSON response
+            try:
+                json_response = response.json()
+            except ValueError as e:
+                logger.error(f"Invalid JSON response: {response.text[:200]}")
+                if attempt < self.max_retries:
+                    backoff = self._calculate_backoff(attempt)
+                    logger.info(f"Retrying after {backoff:.2f} seconds...")
+                    time.sleep(backoff)
+                    return self._do_post(endpoint, data, attempt + 1)
+                else:
+                    raise ValueError(f"Invalid JSON response after {self.max_retries + 1} attempts: {e}")
+            
+            # Check if response contains data
+            data_dict = json_response.get("data", {})
+            if not data_dict:
+                logger.warning("Empty data in response")
+                # Empty data might be valid (no funds found), but log it
+                if isinstance(data_dict, dict) and len(data_dict) == 0:
+                    logger.info("Response data is empty dict (might be valid)")
+            
+            return data_dict
+            
+        except requests.exceptions.Timeout:
+            logger.warning(f"Request timeout. Attempt {attempt + 1}/{self.max_retries + 1}")
+            if attempt < self.max_retries:
+                backoff = self._calculate_backoff(attempt)
+                logger.info(f"Retrying after {backoff:.2f} seconds...")
+                time.sleep(backoff)
+                return self._do_post(endpoint, data, attempt + 1)
+            else:
+                raise Exception(f"Request timeout after {self.max_retries + 1} attempts")
+        
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"Connection error: {e}. Attempt {attempt + 1}/{self.max_retries + 1}")
+            if attempt < self.max_retries:
+                backoff = self._calculate_backoff(attempt)
+                logger.info(f"Retrying after {backoff:.2f} seconds...")
+                time.sleep(backoff)
+                return self._do_post(endpoint, data, attempt + 1)
+            else:
+                raise Exception(f"Connection error after {self.max_retries + 1} attempts: {e}")
+        
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request exception: {e}. Attempt {attempt + 1}/{self.max_retries + 1}")
+            if attempt < self.max_retries:
+                backoff = self._calculate_backoff(attempt)
+                logger.info(f"Retrying after {backoff:.2f} seconds...")
+                time.sleep(backoff)
+                return self._do_post(endpoint, data, attempt + 1)
+            else:
+                raise
 
 def _parse_date(date: Union[str, datetime]) -> str:
     if isinstance(date, datetime):
@@ -162,14 +359,14 @@ def _parse_date(date: Union[str, datetime]) -> str:
 
 def _get_session() -> requests.Session:
     """
-    Create and return a custom requests session with a modified SSL context.
+    Create and return a custom requests session with optimized settings.
 
     This function configures a custom SSL context to use the `OP_LEGACY_SERVER_CONNECT`
     option, which allows for legacy server connections, addressing specific issues
     with OpenSSL 3.0.0.
 
     The custom session uses a custom HTTP adapter that incorporates this modified
-    SSL context for the session's connections.
+    SSL context for the session's connections, along with optimized connection pooling.
 
     This approach is based on solutions found at:
     - https://stackoverflow.com/questions/71603314/ssl-error-unsafe-legacy-renegotiation-disabled/
@@ -190,9 +387,28 @@ def _get_session() -> requests.Session:
                 block=block,
                 ssl_context=self.ssl_context,
             )
-
+    
+    # Configure retry strategy (we handle retries manually, but this is for urllib3)
+    retry_strategy = Retry(
+        total=0,  # We handle retries manually
+        backoff_factor=0,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    
     ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
     ctx.options |= 0x4  # OP_LEGACY_SERVER_CONNECT
-    session = requests.session()
+    
+    session = requests.Session()
+    
+    # Mount custom SSL adapter
     session.mount("https://", CustomHttpAdapter(ctx))
+    
+    # Configure connection pooling with retry strategy
+    adapter = HTTPAdapter(
+        pool_connections=10,
+        pool_maxsize=20,
+        max_retries=retry_strategy,
+    )
+    session.mount("https://", adapter)
+    
     return session
