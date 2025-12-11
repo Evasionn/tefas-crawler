@@ -1,0 +1,121 @@
+name: Auto Tag on Main Commit
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  auto-tag:
+    name: Auto Tag Semantic Version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Get latest tag
+        id: get_tag
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Latest tag: $LATEST_TAG"
+
+      - name: Parse current version
+        id: parse_version
+        run: |
+          LATEST_TAG="${{ steps.get_tag.outputs.latest_tag }}"
+          VERSION="${LATEST_TAG#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          MAJOR=${MAJOR:-0}
+          MINOR=${MINOR:-0}
+          PATCH=${PATCH:-0}
+          echo "major=$MAJOR" >> $GITHUB_OUTPUT
+          echo "minor=$MINOR" >> $GITHUB_OUTPUT
+          echo "patch=$PATCH" >> $GITHUB_OUTPUT
+          echo "Current version: $MAJOR.$MINOR.$PATCH"
+
+      - name: Analyze commit message
+        id: analyze_commit
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $COMMIT_MSG"
+          
+          if echo "$COMMIT_MSG" | grep -qiE "^(BREAKING|BREAKING CHANGE):"; then
+            INCREMENT="major"
+            echo "increment=major" >> $GITHUB_OUTPUT
+            echo "Detected: BREAKING CHANGE → Major version increment"
+          elif echo "$COMMIT_MSG" | grep -qiE "^feat:"; then
+            INCREMENT="minor"
+            echo "increment=minor" >> $GITHUB_OUTPUT
+            echo "Detected: feat → Minor version increment"
+          elif echo "$COMMIT_MSG" | grep -qiE "^fix:"; then
+            INCREMENT="patch"
+            echo "increment=patch" >> $GITHUB_OUTPUT
+            echo "Detected: fix → Patch version increment"
+          else
+            INCREMENT="patch"
+            echo "increment=patch" >> $GITHUB_OUTPUT
+            echo "Detected: default → Patch version increment"
+          fi
+
+      - name: Calculate new version
+        id: new_version
+        run: |
+          MAJOR="${{ steps.parse_version.outputs.major }}"
+          MINOR="${{ steps.parse_version.outputs.minor }}"
+          PATCH="${{ steps.parse_version.outputs.patch }}"
+          INCREMENT="${{ steps.analyze_commit.outputs.increment }}"
+          
+          case "$INCREMENT" in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              ;;
+          esac
+          
+          NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "New version: $NEW_VERSION"
+
+      - name: Check if tag exists
+        id: check_tag
+        run: |
+          NEW_TAG="${{ steps.new_version.outputs.new_version }}"
+          if git rev-parse "$NEW_TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Tag $NEW_TAG already exists, skipping..."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Tag $NEW_TAG does not exist, will create..."
+          fi
+
+      - name: Create and push tag
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          NEW_TAG="${{ steps.new_version.outputs.new_version }}"
+          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          
+          echo "Creating tag: $NEW_TAG"
+          git tag -a "$NEW_TAG" -m "Auto-tagged: $COMMIT_MSG" "$COMMIT_SHA"
+          git push origin "$NEW_TAG"
+          echo "✓ Tag $NEW_TAG created and pushed successfully"
