@@ -51,15 +51,15 @@ jobs:
           COMMIT_MSG=$(git log -1 --pretty=%B)
           echo "Commit message: $COMMIT_MSG"
           
-          if echo "$COMMIT_MSG" | grep -qiE "^(BREAKING|BREAKING CHANGE):"; then
+          if echo "$COMMIT_MSG" | grep -qiE "^(BREAKING|BREAKING CHANGE)[:(]"; then
             INCREMENT="major"
             echo "increment=major" >> $GITHUB_OUTPUT
             echo "Detected: BREAKING CHANGE → Major version increment"
-          elif echo "$COMMIT_MSG" | grep -qiE "^feat:"; then
+          elif echo "$COMMIT_MSG" | grep -qiE "^feat[:(]"; then
             INCREMENT="minor"
             echo "increment=minor" >> $GITHUB_OUTPUT
             echo "Detected: feat → Minor version increment"
-          elif echo "$COMMIT_MSG" | grep -qiE "^fix:"; then
+          elif echo "$COMMIT_MSG" | grep -qiE "^fix[:(]"; then
             INCREMENT="patch"
             echo "increment=patch" >> $GITHUB_OUTPUT
             echo "Detected: fix → Patch version increment"
